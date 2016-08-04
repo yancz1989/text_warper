@@ -2,27 +2,31 @@
 # @Author: yancz1989
 # @Date:   2016-03-19 15:08:02
 # @Last Modified by:   yancz1989
-# @Last Modified time: 2016-05-23 09:44:11
-
+# @Last Modified time: 2016-05-11 10:55:18
+from __future__ import absolute_import
 import sys
 import os
 import time
+import codecs
+import re
 
+from PIL import Image, ImageFont, ImageDraw, ImageOps
 import numpy as np
 import numpy.random as rnd
 import numpy.linalg as LA
 import scipy as sp
 
 import cv2
-import theano
-import theano.tensor as T
 
 import h5py as h5
 
-import lasagne
 
-from util import *
+def list_file(root):
+    return [f for f in listdir(root) if (isfile(join(root, f)) and f[0] != '.')]
 
+def mkdir(dname):
+    if not os.path.exists(dname):
+        os.makedirs(dname)
 # theta: rotation angle
 # scale: scaling factor
 # T: translation parameter, which is a random number in [-1, 1] as the ratio to the boundary
@@ -59,17 +63,34 @@ def array_replicate(arr, cnt):
         for s in arr:
             yield s
 
-def make_sample(case, cnt):
-    base = 'data/sample/' + case + '/'
-    mkdir(base)
-    files = list_file('data/' + case + '/')
-    r1 = 0.25
-    imgS = resize_img(cv2.imread('data/' + case + '/' + files[0], 0), r1).shape
-    imgs = np.vstack([resize_img(cv2.imread('data/' + case + '/' + file), r1).reshape(
-        1, imgS[0], imgS[1], 3).astype(np.float32) for file in files])
-    bg = cv2.imread('data/bg.jpg')
+def make_lines():
+    with codecs.open('../data/meta/sentence.txt', 'r', encoding = 'utf-8') as f:
+        data = re.split(u'\n|。|？|\?|！|\!', f.read().replace(u'\u3000', '').replace(
+            u' ', '').replace(u',', u'，').replace(u'?', u'？').replace(u'.', u'。'))
 
-    l = imgs.shape[0] * cnt
+    all = [s + u'。' for s in data if (
+        len(s) > 5 and (not s[0] in [str(i) for i in range(10)]) and (u'-' not in s))]
+
+    imgs = []
+    for s in all:
+        fsize = int(204.0 / len(s))
+        img = Image.new("RGB", (fsize * len(s), fsize + 3), "black")
+        f = ImageFont.truetype('../data/fonts/Songti.ttc', fsize)
+        draw = ImageDraw.Draw(img)
+        draw.text((0, 0), s, font = f,
+            fill = tuple(np.array([255, 255, 255]).astype(int)))
+        imgs.append(np.array(img))
+
+    return imgs
+
+def make_sample(imgs, cnt):
+    case = 'line'
+    base = '../data/sample/' + case + '/'
+    mkdir(base)
+    bg = cv2.imread('../data/bg.jpg')
+    bg = np.zeros(bg.shape).astype(type(bg[0, 0, 0]))
+
+    l = len(imgs) * cnt
     print('initialize files...')
     f = h5.File(base + case + '.h5', 'w')
     flabel = f.create_dataset('label', (l,), dtype = np.float32)
@@ -77,18 +98,25 @@ def make_sample(case, cnt):
     fTheta = f.create_dataset('theta', (l, ), dtype = np.float32)
     fScale = f.create_dataset('scale', (l, ), dtype = np.float32)
 
+    imgs = [img for i in range(cnt) for img in imgs]
+
     # generater
     labels = rnd.randint(0, 60, size = l)
     thetas = (labels * 3.0 + (rnd.rand(l) - 0.5) * 2.0) / 360.0 * np.pi
-    scales = rnd.rand(l) * (np.min(bg.shape[0 : 2]) / LA.norm(imgS) - 0.8) + 0.8
+    scales = np.array([rnd.rand(cnt) * (np.min(bg.shape[0 : 2]) / LA.norm(img.shape) - 0.8) + 0.8
+                for img in imgs]).flatten()
     Ts = (rnd.rand(l, 2) - 0.5) * 2
-    Ws = [generateT(theta, scale, T, [0,0], [imgS[0], imgS[1], bg.shape[0], bg.shape[1]]) for (theta, scale, T) in zip(thetas, scales, Ts)]
+    Ws = [generateT(theta, scale, T, [0,0], [img.shape[0], img.shape[1], bg.shape[0], bg.shape[1]]) for (theta, scale, T, img) in zip(thetas, scales, Ts, imgs)]
+    print len(Ws)
     imgW = (warp(img[:, :, :], bg, W) for (img, W) in zip(array_replicate(imgs, cnt), Ws))
 
     print('generate data... %d %d...' % (l, cnt))
     for i in range(l):
         flabel[i] = labels[i]
-        fWs[i, :] = Ws[i]
+        # print fWs[i].shape, Ws[i].shape
+        # print type(Ws[i]), type(Ws[i][0, 0])
+        # print Ws[i]
+        fWs[i, :] = Ws[i].astype(np.float32)
         fTheta = thetas[i]
         fScale = scales[i]
         f.flush()
@@ -97,4 +125,8 @@ def make_sample(case, cnt):
 
 if __name__ == '__main__':
     rnd.seed(2012310818)
-    make_sample(sys.argv[1], 50)
+    # make_sample(sys.argv[1], 200)
+    mkdir('../data/lines')
+    imgs = make_lines()
+    make_sample(imgs, cnt = 200)
+
