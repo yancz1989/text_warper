@@ -2,7 +2,7 @@
 # @Author: yancz1989
 # @Date:   2016-06-28 16:50:02
 # @Last Modified by:   yancz1989
-# @Last Modified time: 2016-08-03 15:24:08
+# @Last Modified time: 2016-11-07 09:14:14
 from __future__ import division, absolute_import, print_function, unicode_literals
 
 import sys
@@ -19,212 +19,155 @@ import theano
 import theano.tensor as T
 
 import lasagne
-from make_data import read_poem, make_data, mkdir
-from model import build
-
+from model import Model
+from model_naive import ModelNaive
+from tools import mkdir, get_config, log, decode_image
 import json
 
-def load_data(path, cnt):
-  poems = read_poem('data/poem7.txt')
-  meta = h5.File(path + 'meta.h5', 'r')
-  idx = np.arange(len(poems) * cnt)
-  np.random.shuffle(idx)
+class Trainer(object):
+  def __init__(self):
+    pass
 
-  train_idx = idx[0 : int(len(idx) * 0.8)]
-  val_idx = idx[int(len(idx) * 0.8): int(len(idx) * 0.9)]
-  test_idx = idx[int(len(idx) * 0.9) : len(idx)]
+  def warmup(self, fconfig, model, deterministic = False):
+    np.random.seed(2012310818)
+    config = get_config(fconfig)
 
-  dat = {'poems' : poems, 'train' : train_idx, 'val' : val_idx, 'test' : test_idx}
-  for key in meta:
-    dat[key] = meta[key][:]
-  meta.close()
-  return dat
+    self.path = config['path']
+    self.paraf = config['pfile']
+    self.samples = config['samples']
+    self.opt = config['opt']
+    self.store = config['pstore']
+    self.Arange = config['Arange']
+    self.epochs = config['epochs']
+    self.sliced = config['sliced']
+    self.batchsize = config['batchsize']
+    self.decay = config['decay']
+    self.acc = config['acc']
+    self.recoveru = config['update']
+    self.logf = fconfig[:-4] + 'log'
+    self.dat_patch = h5.File(config['path'] + 'dat_patch_' + str(config['Arange']) + '.h5')
+    self.dat_pmask = h5.File(config['path'] + 'dat_patch_' + str(config['Arange']) + '.h5')
 
-def iterate_minibatch(idx, batchsize, l):
-  for start in range(0, l, batchsize):
-    yield np.array(idx[start : start + batchsize], dtype='int32')
+    self.model = model
+    self.model.load(config)
+    self.model.build(deterministic = False)
 
-def read_image(fp, shape = (-1, -1)):
-  img = cv2.imread(fp)
-  if shape[0] == -1:
-    shape = img.shape[0 : 2]
-  img = np.rollaxis(cv2.resize(img, shape, interpolation = cv2.INTER_CUBIC), 2, 0).astype(np.float32)
-  for i in range(len(img)):
-    img[i, :] = (img[i, :] - np.min(img[i, :])) / (np.max(img[i, :]) - np.min(img[i, :]))
-  return img
+    with open(config['path'] + 'parameter_' + str(config['Arange']) + '.json', 'r') as f:
+      self.meta = json.load(f)
+    # with open(config['slice'], 'r') as f:
+    #   slices = json.load(f)
 
-def get_inputs(batch, path, dat, cnt, shape, acc):
-  idxs = np.array(batch / cnt, dtype=np.int32)
-  idxs_ = batch % cnt
-  input = np.array([read_image(path + 'imgs/' + str(idx) + '/' + str(idx_) + '.jpg', shape = (224, 224)) for idx, idx_ in zip(idxs, idxs_)]).astype(np.float32)
-  seg = np.array([read_image(path + 'gt/' + str(idx) + '/' + str(idx_) + '.jpg', shape = (224, 224))
-    for idx, idx_ in zip(idxs, idxs_)]).astype(np.float32)
-  Ps = np.array(dat['Ps'][idxs, idxs_, :]).astype(np.float64) * 1e4 + 1e-9
-  # Ps = np.array(dat['labels'][idxs, idxs_]) // acc
-  angles = np.array(dat['labels'][idxs, idxs_]) // acc
-  box = np.array(dat['boxes'][idxs, idxs_, :]).astype(np.float32)
-  return input, seg, Ps, angles, box
+    # if self.sliced == False:
+      # all = slices['train'] + slices['val'] + slices['test']
+      # all = [all[i] for i in np.random.permutation(len(all))]
+      # self.train_idx = all[0 : int(self.samples * 0.8)]
+      # self.val_idx = all[int(self.samples * 0.8) : int(self.samples * 0.9)]
+      # self.test_idx = all[int(self.samples * 0.9) : self.samples]
+    #   with open(config['path'] + 'unsliced.json') as f:
+    #     self.dat_idx = json.load(f)
+    #   print('not sliced')
+    # else:
+      # self.train_idx = [slices['train'][i] for i in
+      #      np.random.permutation(len(slices['train']))[0 : int(self.samples * 0.8)]]
+      # self.val_idx = [slices['val'][i] for i in
+      #       np.random.permutation(len(slices['val']))[0 : int(self.samples * 0.1)]]
+      # self.test_idx = [slices['test'][i] for i in
+      #       np.random.permutation(len(slices['test']))[0 : int(self.samples * 0.1)]]
+      # with open
+      # print('sliced')
 
-def get_time_stamp():
-  return datetime.datetime.now().strftime("%Y-%m-%d-%H_%M_%S")
+    with open(config['path'] + ('unsliced.json' if self.sliced == False else 'sliced.json')) as f:
+      self.dat_idx = json.load(f)
 
-def save_parameter(network, path, epoch):
-  paras = lasagne.layers.get_all_param_values(network)
-  with h5.File(path + str(epoch) + '.h5', 'w') as dat:
-    for i, para in zip(range(len(paras)), paras):
-      dat[str(i)] = para
-    dat.close()
+    self.train_idx = self.dat_idx['train']
+    self.val_idx = self.dat_idx['val']
+    self.test_idx = self.dat_idx['test']
 
-def load_parameter(net, fname):
-  paras = []
-  with h5.File(fname, 'r') as dat:
-    for i in range(len(dat)):
-      paras.append(dat[str(i)][:])
-    lasagne.layers.set_all_param_values(net, paras)
-    dat.close()
 
-def get_config(fpath):
-  with open(fpath) as f:
-    config = json.load(f)
-    input_shp = (config['input'], config['input'])
-    opt = config['opt']
-    path = config['path']
-    learning_rate = np.float32(config['learning_rate'])
-    decay = config['decay']
-    epochs = config['epochs']
-    batchsize = config['batchsize']
-    ksize = config['ksize']
-    store = config['pstore']
-    paraf = config['pfile']
-    stride = config['stride']
-    acc = config['acc']
-    samples = config['samples']
-  return (input_shp, opt, path, learning_rate, decay, epochs, batchsize, ksize, store, paraf, stride, acc, samples)
+    self.idx = [i + 1 for i, t in enumerate(self.opt) if t == 1]
+    sops = ['segment', 'perspective', 'angle', 'mal']
+    print(('%d training samples, %d validation samples, %d test samples...with option: '
+      + ''.join([sops[i - 1] + ' ' for i in self.idx]))
+       %  tuple([len(self.train_idx), len(self.val_idx), len(self.test_idx)]))
+    self.tmp_dir = self.path + self.store 
+    mkdir(self.tmp_dir)
 
-def train(fpath):
-  input_shp, opt, path, learning_rate, decay, epochs, batchsize, ksize, store, paraf, stride, acc, samples = get_config(fpath)
-  print('config: ksize %s, stride %s, batchsize %d.' % (str(ksize), str(stride), batchsize))
+  def get_inputs(self, batch):
+    input = np.array([self.dat_patch[idx][:] for idx in batch])
+    seg = None # np.array([self.dat_pmask[idx + '.jpg'] for idx in batch])
+    dat = [self.meta[key] for key in batch]
+    Ps = np.array([(np.array(dat[i][4]) + 1e-3) * 1e4 for i in range(len(batch))]).astype(np.float32)
+    angles = np.array([np.int32((dat[i][1] / np.pi * 180 + self.Arange / 2) / self.acc)
+      for i in range(len(batch))])
+    return input, seg, Ps, angles
 
-  network, lr, ftrain, fvals, predict = build(input_shp, opt, acc, learning_rate, ksize, stride)
-  seg_shape = lasagne.layers.get_output_shape(network['conv1_2'])[2 : 4]
+  def iterate_minibatch(self, idx, batchsize, l):
+    ridx = np.random.permutation(range(0, l, batchsize))
+    for start in ridx:
+      yield idx[start : start + batchsize]
 
-  dat = load_data(path, samples)
-  idx = [i + 1 for i, t in enumerate(opt) if t == 1]
-  lidx = len(idx) + 1
-  sops = ['segment', 'perspective', 'angle', 'location']
-  print(('%d training samples, %d validation samples, %d test samples...with option: '
-    + ''.join([sops[i - 1] + ' ' for i in idx]))
-     %  tuple([len(dat['train']), len(dat['val']), len(dat['test'])]))
+  def train(self):
+    lidx = len(self.idx) + 1
+    with h5.File(self.tmp_dir + 'loss.h5', 'w') as f:
+      f['loss'] = -1.0 * np.ones((10000, lidx * 2))
 
-  tmp_dir = path + store
-  mkdir(tmp_dir)
+    start = 1
+    if self.paraf != '':
+      self.paraf = int(self.paraf)
+      self.model.recover(self.paraf, 'angleout')
+      start = self.paraf + 1
+      log('load parameters from %s, start from epoch %d.' % (self.paraf, start), self.logf)
+    if self.recoveru:
+      self.model.recover_update()
+    innerT = 0
+    innerV = 0
+    if self.opt[3] == 1:
+      self.idx = self.idx[:-1]
 
-  with h5.File(tmp_dir + 'loss.h5', 'w') as f:
-    f['loss'] = -1.0 * np.ones((10000, lidx * 2))
+    print('start training...')
+    for epoch in range(start, self.epochs + start):
+      # loss[0] train loss, loss[1 : lidx + 1] train loss for each target, else validate
+      loss = np.zeros(lidx * 2)
+      trs = 0
+      vls = 0
+      err = 0
+      start = time.time()
 
-  start = 1
-  if paraf != '':
-    paraf = tmp_dir + paraf
-    load_parameter(network['angle'], paraf)
-    start = int(paraf[paraf.rfind('/') + 1 : paraf.rfind('.')]) + 1
-    print('load parameters from %s, start from epoch %d.' % (paraf, start))
-  print('start training...')
-  for epoch in range(start, epochs + start):
-    # loss[0] train loss, loss[1 : lidx + 1] train loss for each target, else validate
-    loss = np.zeros(lidx * 2)
-    trs = 0
-    vls = 0
-    err = 0
-    start = time.time()
-    for batch in iterate_minibatch(dat['train'], batchsize, len(dat['train'])):
-      inputs = get_inputs(batch, path, dat, samples, seg_shape, acc)
-      ftrain(*[inputs[i] for i in ([0] + idx)])
-      loss[:lidx] += np.array(fvals(*[inputs[i] for i in ([0] + idx)]))
-      trs += 1
-    for batch in iterate_minibatch(dat['val'], batchsize, len(dat['val'])):
-      inputs = get_inputs(batch, path, dat, samples, seg_shape, acc)
-      loss[lidx: 2 * lidx] += np.array(fvals(*[inputs[i] for i in ([0] + idx)]))
-      vls += 1
-    loss[:lidx] /= trs
-    loss[lidx : 2 * lidx] /= vls
-    with h5.File(tmp_dir + 'loss.h5') as f:
-      f['loss'][epoch, :] = loss
-    save_parameter(network['angle'], tmp_dir, epoch)
-    tpass = time.time() - start
-    fmt = ('epoch %d: time %f train loss:' + ''.join([' %f' for i in range(lidx)])
-      + ', valid:' + ''.join([' %f' for i in range(lidx)]))
-    print(fmt % tuple([epoch, tpass] + list(loss)))
-    if decay == 'stagewise':
-      if epoch % 25 == 0:
-        lr = lr * 0.5
-    elif decay == 'exponent':
-      lr = lr * 0.95
-    elif decay == 'constant':
-      lr = lr
-    else:
-      raise Exception('Decay method unknown.')
+      for batch in self.iterate_minibatch(self.train_idx, self.batchsize, len(self.train_idx)):
+        inputs = self.get_inputs(batch)
+        self.model.ftrain(*[inputs[i] for i in ([0] + self.idx)])
+        vvals = np.array(self.model.fval(*[inputs[i] for i in ([0] + self.idx)]))
+        log('train ' + str(innerT) + ''.join([' ' + str(v) for v in vvals]), self.logf)
+        loss[:lidx] += vvals
+        trs += 1
+        innerT += 1
 
-# test parameter file.
-def test(fpath, epochs):
-  input_shp, opt, path, learning_rate, decay, _, batchsize, ksize, store, _, stride, acc, samples = get_config(fpath)
+      for batch in self.iterate_minibatch(self.val_idx, self.batchsize, len(self.val_idx)):
+        inputs = self.get_inputs(batch)
+        vvals = np.array(self.model.fval(*[inputs[i] for i in ([0] + self.idx)]))
+        log('val ' + str(innerV) + ''.join([' ' + str(v) for v in vvals]), self.logf)
+        loss[lidx: 2 * lidx] += vvals
+        vls += 1
+        innerV += 1 
 
-  network, lr, ftrain, fvals, predict = build(input_shp, opt, acc, learning_rate, ksize, stride)
-  seg_shape = lasagne.layers.get_output_shape(network['conv1_2'])[2 : 4]
+      loss[:lidx] /= trs
+      loss[lidx : 2 * lidx] /= vls
+      with h5.File(self.tmp_dir + 'loss.h5') as f:
+        f['loss'][epoch, :] = loss
+      self.model.save(epoch, 'angleout')
 
-  dat = load_data(path, samples)
-  idx = [i + 1 for i, t in enumerate(opt) if t == 1]
-  lidx = len(idx)
-  sops = ['segment', 'perspective', 'angle', 'location']
-  print(('%d training samples, %d validation samples, %d test samples...with option: '
-    + ''.join([sops[i - 1] + ' ' for i in idx]))
-     %  tuple([len(dat['train']), len(dat['val']), len(dat['test'])]))
+      tpass = time.time() - start
+      fmt = ('epoch %d time %f train loss' + ''.join([' %f' for i in range(lidx)])
+        + ' valid' + ''.join([' %f' for i in range(lidx)]))
+      log(fmt % tuple([epoch, tpass] + list(loss)), self.logf)
 
-  tmp_dir = path + store
-
-  print('testing start...')
-  for epoch in epochs:
-    # loss[0] train loss, loss[1 : lidx + 1] train loss for each target, else validate
-    loss = np.zeros(1 + len(idx) * 2)
-    trs = 0
-    vls = 0
-    err = 0
-    start = time.time()
-    load_parameter(network['angle'], tmp_dir + str(epoch) + '.h5')
-    for batch in iterate_minibatch(dat['train'], batchsize, len(dat['train'])):
-      inputs = get_inputs(batch, path, dat, samples, seg_shape, acc)
-      loss[:lidx] += np.array(fvals(*[inputs[i] for i in ([0] + idx)]))
-      print(fpred['angle'](inputs[0]))
-      print(inputs[3])
-      trs += 1
-    for batch in iterate_minibatch(dat['val'], batchsize, len(dat['val'])):
-      inputs = get_inputs(batch, path, dat, samples, seg_shape, acc)
-      loss[lidx: 2 * lidx] += np.array(fvals(*[inputs[i] for i in ([0] + idx)]))
-      print(fpred['angle'](inputs[0]))
-      print(inputs[3])
-      vls += 1
-    loss[:lidx] /= trs
-    loss[lidx + 1 : 2 * lidx + 1] /= vls
-    tpass = time.time() - start
-    fmt = ('epoch %d: time %f train loss %f, components:' + ''.join([' %f' for i in range(lidx)])
-      + ', valid:' + ''.join([' %f' for i in range(lidx)]))
-    print(fmt % tuple([epoch, tpass] + list(loss)))
-    sys.stdout.flush()
+  def test():
+    pass
 
 if __name__ == '__main__':
-  np.random.seed(2012310818)
-  input_shp = (224, 224)
-  sys.stdout = open(sys.argv[3], 'a')
-  if sys.argv[1] == 'data':
-    imgS = [180, 180, 224, 224]
-    cnt = int(sys.argv[2])
-    # scale, rotation, translation, perspective
-    lopt = [int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])]
-    if lopt[1] == 0:
-      make_data('/home/yancz/text_generator/data/' + sys.argv[7] + '/', cnt, imgS,
-        cls = int(sys.argv[8]), flags = lopt)
-    else:
-      make_data('/home/yancz/text_generator/data/' + sys.argv[7] + '/', cnt, imgS, flags = lopt)
-  elif sys.argv[1] == 'train':
-    train(sys.argv[2])
-  elif sys.argv[1] == 'test':
-    test(sys.argv[2], range(10, 20))
+  model = ModelNaive()
+  trainer = Trainer()
+  trainer.warmup(sys.argv[1], model, deterministic = False)
+  trainer.train()
+
+
